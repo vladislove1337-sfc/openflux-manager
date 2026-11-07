@@ -2,18 +2,36 @@
 
 Интерактивный установщик + менеджер выходной ноды **OpenFlux / Cups.online** на Ubuntu 22.04 LTS (Python 3.10+, systemd). Не каскад, не proxy-panel. Для нового сервера **сначала пункт 1 (установить), затем пункт 2 (создать комнаты), потом пункты 3 и 8 (данные для iPhone)**.
 
-## Установка самого меню
+## Установка по одной ссылке (рекомендуется)
 
-Перенесите `openflux-manager-v2.zip` на VPS, например в `/root/`, затем от root:
+Загрузите в **корень GitHub-репозитория** четыре файла: `bootstrap.sh`, `install.sh`, `openflux_menu.py`, `README.md`.
+
+На чистом VPS от `root` (Ubuntu 22.04+, нужны `curl` и `python3`):
 
 ```bash
-mkdir -p /root/openflux-manager-v2
-python3 -m zipfile -e /root/openflux-manager-v2.zip /root/openflux-manager-v2
-sh /root/openflux-manager-v2/install.sh
+set -o pipefail; curl -fsSL https://raw.githubusercontent.com/vladislove1337-sfc/openflux-manager/main/bootstrap.sh | bash
+```
+
+Если работаете не от `root`, замените конечное `| bash` на `| sudo bash`.
+Скрипт сам скачает свежую копию исходников из ветки `main`, установит **только меню** и удалит временные файлы. Затем:
+
+```bash
 openflux-menu
 ```
 
-Эта операция устанавливает **только меню** в `/usr/local/sbin/openflux-menu`; **не трогает** работающие службы, AES-ключ, комнаты и OpenFlux. Пункт **1** внутри меню уже устанавливает сам OpenFlux.
+Внутри меню пункт **1** ставит сам OpenFlux и службу, пункт **2** создаёт комнаты Cups.online.
+**Перед первым запуском на реальном VPS проверьте код `bootstrap.sh`, `install.sh` и `openflux_menu.py`: запуск скачанного кода от `root` даёт ему полные права на сервер.**
+
+### Установка без bootstrap.sh (через git)
+
+```bash
+apt-get update && apt-get install -y git python3
+DIR=$(mktemp -d)
+git clone --depth 1 https://github.com/vladislove1337-sfc/openflux-manager.git "$DIR"
+sh "$DIR/install.sh"
+rm -rf "$DIR"
+openflux-menu
+```
 
 ## Пункты меню
 
