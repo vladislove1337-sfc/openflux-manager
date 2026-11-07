@@ -16,13 +16,14 @@ import tempfile
 import time
 from pathlib import Path
 
-VERSION = "2.0.0"
+VERSION = "2.2.0"
 RELEASE_TAG = "v0.17.1"
 RELEASE_ROOT = "https://github.com/OpenFluxTeam/OpenFlux/releases/download"
 UNIT = Path("/etc/systemd/system/openflux-cups.service")
 LAUNCH = Path("/usr/local/libexec/openflux-cups-launch")
 DATA = Path("/var/lib/openflux")
 LOG_MAX = 5000
+DOWNLOAD_CACHE = Path("/var/cache/openflux-manager")
 SERVICE = "openflux-cups.service"
 ENV = Path("/etc/openflux/cups.env")
 BACKUPS = Path("/etc/openflux/backups")
@@ -422,6 +423,91 @@ def curl_get(url, out):
         raise MenuError("Получен пустой файл с GitHub")
 
 
+def sha256_file(path):
+    hasher = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def download_core_resumable(url, asset, expected_sha256):
+    """Download to persistent cache; curl retries resume partial transfers.
+
+    The checksum is mandatory before the cached file can be installed.
+    Interrupted runs retain the .part file for the next invocation.
+    """
+    cache_dir = DOWNLOAD_CACHE / RELEASE_TAG
+    cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(cache_dir, 0o700)
+    part = cache_dir / (asset + ".part")
+
+    if part.exists():
+        if not part.is_file() or part.is_symlink():
+            raise MenuError(f"Кэш скачивания не является обычным файлом: {part}")
+        os.chmod(part, 0o600)
+        if part.stat().st_size and sha256_file(part) == expected_sha256:
+            print("Файл уже полностью скачан и прошёл SHA256, использую кэш.", flush=True)
+            return part
+        print(f"Найден недокачанный файл: {part.stat().st_size / (1024 * 1024):.1f} МиБ.", flush=True)
+    else:
+        part.touch(mode=0o600)
+
+    # A full attempt may last 20 minutes on a slow VPS. Curl's standard
+    # transfer meter is intentionally visible (percentage + current speed).
+    # Low-speed detection avoids indefinitely stuck connections.
+    for attempt in range(1, 5):
+        offset = part.stat().st_size
+        print(f"\nПопытка {attempt}/4; уже загружено: {offset / (1024 * 1024):.1f} МиБ", flush=True)
+        print("Прогресс/скорость показывает curl. Ctrl+C сохранит недокачанный файл.", flush=True)
+        args = [
+            "curl", "--fail", "--location", "--show-error",
+            "--connect-timeout", "20",
+            "--speed-limit", "1024", "--speed-time", "90",
+            "--max-time", "1200",
+            "--continue-at", "-",
+            "--output", str(part), url,
+        ]
+        try:
+            completed = subprocess.run(args, timeout=1230, check=False)
+            return_code = completed.returncode
+        except subprocess.TimeoutExpired:
+            return_code = 124
+            print("Внешний лимит времени попытки превышен.", flush=True)
+        except OSError as exc:
+            raise MenuError(f"Не удалось запустить curl: {exc}") from exc
+
+        # Verify even when curl reports a transfer error: the file may have
+        # completed just before the connection was closed.
+        if part.stat().st_size and sha256_file(part) == expected_sha256:
+            print("\nSHA256: OK — файл скачан полностью.", flush=True)
+            return part
+
+        if return_code == 0:
+            # A completed transfer with a bad hash is not safe to resume.
+            # Recreate the partial file from zero; never install a bad hash.
+            print("ВНИМАНИЕ: SHA256 не совпал, повреждённый кэш удалён.", flush=True)
+            part.unlink()
+            part.touch(mode=0o600)
+        elif return_code in (22, 33):
+            if return_code == 22:
+                raise MenuError("GitHub вернул ошибку HTTP. Проверь адрес релиза и доступ к GitHub.")
+            print("Сервер не поддержал докачку; следующая попытка начнётся заново.", flush=True)
+            part.unlink()
+            part.touch(mode=0o600)
+        else:
+            print(f"Ошибка curl (код {return_code}), сохранено {part.stat().st_size / (1024 * 1024):.1f} МиБ.", flush=True)
+
+        if attempt < 4:
+            time.sleep(3)
+
+    raise MenuError(
+        "Не удалось завершить проверенную загрузку за 4 попытки. "
+        f"Недокачанный файл сохранён: {part}. "
+        "Повтори пункт 1 — загрузка продолжится с сохранённого объёма."
+    )
+
+
 def architecture_asset():
     machine = platform.machine().lower()
     mapping = {"x86_64": "openflux-linux-amd64", "aarch64": "openflux-linux-arm64",
@@ -438,7 +524,6 @@ def download_verified_core():
     with tempfile.TemporaryDirectory(prefix="openflux-download-") as td:
         td = Path(td)
         sums = td / "SHA256SUMS.txt"
-        target = td / asset
         print(f"Скачиваю официальный OpenFlux {RELEASE_TAG} ({asset})")
         curl_get(f"{url}/SHA256SUMS.txt", sums)
         digest = None
@@ -449,14 +534,9 @@ def download_verified_core():
                 break
         if not digest:
             raise MenuError(f"В официальном SHA256SUMS.txt нет хеша для {asset}. Установка остановлена.")
-        curl_get(f"{url}/{asset}", target)
-        hasher = hashlib.sha256()
-        with target.open("rb") as f:
-            for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                hasher.update(chunk)
-        h = hasher.hexdigest()
-        if h != digest:
-            raise MenuError(f"SHA256 НЕ СОВПАЛ! Ожидалось {digest}, получено {h}. Установка остановлена.")
+        target = download_core_resumable(f"{url}/{asset}", asset, digest)
+        if sha256_file(target) != digest:
+            raise MenuError("SHA256 НЕ СОВПАЛ: установка остановлена.")
         print("SHA256: OK (сверен с манифестом этого же релиза)")
         BINARY.parent.mkdir(parents=True, exist_ok=True)
         if BINARY.exists():
